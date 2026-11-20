@@ -1,0 +1,102 @@
+name: Sync README from source
+
+# Pulls README.md from the (internal) source repo's default branch, re-applies
+# the standalone link patch, re-runs the source repo's own denylist gate, and
+# publishes here only if the result changed.
+#
+# Safety: a sentinel guard means the sync refuses to publish a README that does
+# not look like the approved version (e.g. stale `main` before PR #12 merges),
+# so it can never overwrite this public copy with an older one.
+#
+# Requires two repo secrets (kept out of this public file on purpose):
+#   SOURCE_REPO        the owner/name of the internal source repo
+#   SOURCE_REPO_TOKEN  a token that can READ that repo's contents (classic PAT
+#                      with `repo` scope, or a fine-grained PAT with Contents: Read)
+
+on:
+  schedule:
+    - cron: '17 6 * * *'   # daily, 06:17 UTC
+  workflow_dispatch: {}      # run on demand (use this right after PR #12 merges)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-readme
+  cancel-in-progress: false
+
+env:
+  SOURCE_REF: main
+  SENTINEL: endor-oss-api-secret
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+    steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v4
+
+      - name: Fetch source README + denylist gate files
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .sync
+          gh api "repos/$SOURCE_REPO/contents/README.md?ref=$SOURCE_REF" \
+            -H "Accept: application/vnd.github.raw" > .sync/README.new
+          gh api "repos/$SOURCE_REPO/contents/scripts/check_denylist.sh?ref=$SOURCE_REF" \
+            -H "Accept: application/vnd.github.raw" > .sync/check_denylist.sh
+          gh api "repos/$SOURCE_REPO/contents/scripts/denylist.txt?ref=$SOURCE_REF" \
+            -H "Accept: application/vnd.github.raw" > .sync/denylist.txt
+
+      - name: Guard — source must be the approved README
+        run: |
+          set -euo pipefail
+          if ! grep -q "$SENTINEL" .sync/README.new; then
+            echo "Source README on '$SOURCE_REF' lacks sentinel '$SENTINEL'."
+            echo "Treating as not-yet-updated (e.g. PR #12 not merged). Skipping — public copy left untouched."
+            echo "skip=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Patch standalone link
+        if: env.skip != '1'
+        run: |
+          set -euo pipefail
+          perl -pi -e 's{\[installer bundle README\]\(marketplace/vm-installer/README\.md\)}{installer bundle README (in the agent repository)}' .sync/README.new
+          if grep -nE '\]\((marketplace|service|tests)/' .sync/README.new; then
+            echo "A repo-relative link survived the patch — aborting rather than publishing a broken link." >&2
+            exit 1
+          fi
+
+      - name: Denylist gate
+        if: env.skip != '1'
+        run: |
+          set -euo pipefail
+          mkdir -p .sync/scripts .sync/scanroot
+          cp .sync/check_denylist.sh .sync/scripts/check_denylist.sh
+          cp .sync/denylist.txt      .sync/scripts/denylist.txt
+          chmod +x .sync/scripts/check_denylist.sh
+          cp .sync/README.new .sync/scanroot/README.md
+          bash .sync/scripts/check_denylist.sh "$PWD/.sync/scanroot"
+
+      - name: Publish if changed
+        if: env.skip != '1'
+        run: |
+          set -euo pipefail
+          if cmp -s .sync/README.new README.md; then
+            echo "No change — nothing to publish."
+            exit 0
+          fi
+          cp .sync/README.new README.md
+          rm -rf .sync
+          git config user.name  "readme-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Sync README from ${SOURCE_REPO}@${SOURCE_REF}"
+          git push
+
+      - name: Clean workspace
+        if: always()
+        run: rm -rf .sync
