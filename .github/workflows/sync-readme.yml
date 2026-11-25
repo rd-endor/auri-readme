@@ -9,9 +9,9 @@ name: Sync README from source
 # so it can never overwrite this public copy with an older one.
 #
 # Requires two repo secrets (kept out of this public file on purpose):
-#   SOURCE_REPO        the owner/name of the internal source repo
-#   SOURCE_REPO_TOKEN  a token that can READ that repo's contents (classic PAT
-#                      with `repo` scope, or a fine-grained PAT with Contents: Read)
+#   SOURCE_REPO     the owner/name of the internal source repo
+#   SOURCE_SSH_KEY  the PRIVATE half of a read-only deploy key registered on the
+#                   source repo (the org forbids classic PATs, so we use a deploy key)
 
 on:
   schedule:
@@ -38,18 +38,20 @@ jobs:
       - name: Checkout public repo
         uses: actions/checkout@v4
 
-      - name: Fetch source README + denylist gate files
+      - name: Fetch source files via read-only deploy key
         env:
-          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          SOURCE_SSH_KEY: ${{ secrets.SOURCE_SSH_KEY }}
         run: |
           set -euo pipefail
-          mkdir -p .sync
-          gh api "repos/$SOURCE_REPO/contents/README.md?ref=$SOURCE_REF" \
-            -H "Accept: application/vnd.github.raw" > .sync/README.new
-          gh api "repos/$SOURCE_REPO/contents/scripts/check_denylist.sh?ref=$SOURCE_REF" \
-            -H "Accept: application/vnd.github.raw" > .sync/check_denylist.sh
-          gh api "repos/$SOURCE_REPO/contents/scripts/denylist.txt?ref=$SOURCE_REF" \
-            -H "Accept: application/vnd.github.raw" > .sync/denylist.txt
+          mkdir -p .sync "$HOME/.ssh"
+          printf '%s\n' "$SOURCE_SSH_KEY" > "$HOME/.ssh/source_key"
+          chmod 600 "$HOME/.ssh/source_key"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/source_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone --depth 1 --branch "$SOURCE_REF" "git@github.com:${SOURCE_REPO}.git" .sync/src
+          cp .sync/src/README.md                 .sync/README.new
+          cp .sync/src/scripts/check_denylist.sh .sync/check_denylist.sh
+          cp .sync/src/scripts/denylist.txt      .sync/denylist.txt
+          rm -rf .sync/src "$HOME/.ssh/source_key"
 
       - name: Guard — source must be the approved README
         run: |
